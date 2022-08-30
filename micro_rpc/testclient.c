@@ -79,9 +79,9 @@ enum conn_state {
 };
 
 static uint32_t max_pending = 64;
-static uint32_t max_conn_pending = 16;
+static uint32_t max_conn_pending = 32;
 static uint32_t message_size = 64;
-static uint32_t num_conns = 8;
+// static uint32_t num_conns = 8;
 static uint32_t num_msgs = 0;
 static uint32_t openall_delay = 0;
 static struct sockaddr_in *addrs;
@@ -109,6 +109,7 @@ struct connection {
 struct core {
     struct connection *conns;
     uint64_t messages;
+    uint32_t num_conns;
 #ifdef PRINT_STATS
     uint64_t rx_calls;
     uint64_t rx_short;
@@ -132,6 +133,9 @@ struct core {
     uint32_t conn_pending;
     uint32_t conn_open;
     pthread_t pthread;
+    /* calc mean latency */
+    uint64_t total_latency;
+    uint64_t total_flows;
 } __attribute__((aligned(64)));
 
 static void open_all(struct core *c);
@@ -159,6 +163,8 @@ static inline void record_latency(struct core *c, uint64_t nanos)
     if (bucket >= HIST_BUCKETS) {
         bucket = HIST_BUCKETS - 1;
     }
+    c->total_latency += nanos;
+    c->total_flows += 1;
     __sync_fetch_and_add(&c->hist[bucket], 1);
 }
 
@@ -274,7 +280,7 @@ static void prepare_core(struct core *c)
     c->sc = sc;
 
     /* create epoll */
-    if ((c->ep = ss_epoll_create(sc, 4 * num_conns)) < 0) {
+    if ((c->ep = ss_epoll_create(sc, 4 * c->num_conns)) < 0) {
         fprintf(stderr, "[%d] epoll_create failed\n", c->ep);
         abort();
     }
@@ -286,15 +292,15 @@ static void prepare_core(struct core *c)
     }
 
     /* Allocate connection structs */
-    if ((c->conns = calloc(num_conns, sizeof(*c->conns))) == NULL) {
+    if ((c->conns = calloc(c->num_conns, sizeof(*c->conns))) == NULL) {
         fprintf(stderr, "[%d] allocating connection structs failed\n", cn);
         abort();
     }
 
     /* Initiate connections */
     c->closed_conns = NULL;
-    next_addr = (num_conns * c->id) % addrs_num;
-    for (i = 0; i < num_conns; i++) {
+    next_addr = (c->num_conns * c->id) % addrs_num;
+    for (i = 0; i < c->num_conns; i++) {
         if ((buf = malloc(message_size * 2)) == NULL) {
             fprintf(stderr, "[%d] allocating conn buffer failed\n", cn);
         }
@@ -390,7 +396,6 @@ static inline int conn_receive(struct core *c, struct connection *co)
             STATS_ADD(c, rx_fail, 1);
         }
     } while (co->pending > 0 && ret > 0);
-
     if (co->state == CONN_CLOSING && co->pending == 0) {
         conn_close(c, co);
         return 1;
@@ -446,13 +451,13 @@ static inline int conn_send(struct core *c, struct connection *co)
                 co->pending++;
                 co->tx_cnt++;
                 co->tx_remain = message_size;
-                if ((co->pending < max_pending || max_pending == 0) &&
-                    (co->tx_cnt < num_msgs || num_msgs == 0))
-                {
-                    /* send next message when epoll tells us to */
-                    wait_wr = 1;
-                    break;
-                }
+                // if ((co->pending < max_pending || max_pending == 0) &&
+                //     (co->tx_cnt < num_msgs || num_msgs == 0))
+                // {
+                //     /* send next message when epoll tells us to */
+                //     wait_wr = 1;
+                //     break;
+                // }
             }
         } else if (ret < 0 && errno != EAGAIN) {
             /* send failed */
@@ -574,7 +579,7 @@ static void open_all(struct core *c)
     ep = c->ep;
     sc = c->sc;
 
-    while (c->conn_open != num_conns) {
+    while (c->conn_open != c->num_conns) {
         connect_more(c);
 
         /* epoll, wait for events */
@@ -625,7 +630,7 @@ static void open_all(struct core *c)
         }
     }
 
-    for (i = 0; i < (int) num_conns; i++) {
+    for (i = 0; i < (int) c->num_conns; i++) {
         co = &c->conns[i];
         ev.data.ptr = co;
         ev.events = SS_EPOLLIN | SS_EPOLLHUP | SS_EPOLLERR | SS_EPOLLOUT;
@@ -656,7 +661,7 @@ static void *thread_run(void *arg)
     ep = c->ep;
     sc = c->sc;
 
-    num_evs = 4 * num_conns;
+    num_evs = 4 * c->num_conns;
     if ((evs = calloc(num_evs, sizeof(*evs))) == NULL) {
         fprintf(stderr, "[%d] malloc failed\n", cn);
     }
@@ -746,9 +751,10 @@ int main(int argc, char *argv[])
     long double *ttp, tp, tp_total;
     uint32_t *hist, hx;
     uint64_t msg_total, open_total;
+    uint64_t total_flows, total_latency;
     double fracs[6] = { 0.5, 0.9, 0.95, 0.99, 0.999, 0.9999 };
     size_t fracs_pos[sizeof(fracs) / sizeof(fracs[0])];
-
+    uint32_t conns = 0;
     setlocale(LC_NUMERIC, "");
 
     if (argc < 5 || argc > 11) {
@@ -780,7 +786,8 @@ int main(int argc, char *argv[])
     }
 
     if (argc >= 8) {
-        num_conns = atoi(argv[7]);
+        // num_conns = atoi(argv[7]);
+        conns = atoi(argv[7]);
     }
 
     if (argc >= 9) {
@@ -807,7 +814,14 @@ int main(int argc, char *argv[])
         fprintf(stderr, "allocating total histogram failed\n");
         abort();
     }
-
+    while(conns > 0) {
+        for (i = 0; i < num_threads; i++) {
+            if(conns == 0)
+                break;
+            cs[i].num_conns += 1;
+            conns -= 1;     
+        }
+    }
 
     for (i = 0; i < num_threads; i++) {
         cs[i].id = i;
@@ -829,6 +843,8 @@ int main(int argc, char *argv[])
         tp_total = 0;
         msg_total = 0;
         open_total = 0;
+        total_flows = 0;
+        total_latency = 0;
         for (i = 0; i < num_threads; i++) {
             tp = cs[i].messages;
             open_total += cs[i].conn_open;
@@ -836,11 +852,13 @@ int main(int argc, char *argv[])
             tp /= (double) (t_cur - t_prev) / 1000000000.;
             ttp[i] = tp;
             tp_total += tp;
-
+            total_flows += cs[i].total_flows;
+            total_latency += cs[i].total_latency;
             for (j = 0; j < HIST_BUCKETS; j++) {
                 hx = cs[i].hist[j];
                 msg_total += hx;
                 hist[j] += hx;
+                
             }
         }
 
@@ -849,11 +867,11 @@ int main(int argc, char *argv[])
 
 
         printf("TP: total=%'.2Lf mbps  50p=%d us  90p=%d us  95p=%d us  "
-                "99p=%d us  99.9p=%d us  99.99p=%d us  flows=%lu",
+                "99p=%d us  99.9p=%d us  99.99p=%d us mean=%lu us flows=%lu",
                 tp_total * message_size * 8 / 1000000.,
                 hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
                 hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
-                hist_value(fracs_pos[4]), hist_value(fracs_pos[5]),
+                hist_value(fracs_pos[4]), hist_value(fracs_pos[5]), total_latency / total_flows / 1000, 
                 open_total);
 
 #ifdef PRINT_PERCORE
@@ -882,7 +900,7 @@ int main(int argc, char *argv[])
                 txc, read_cnt(&cs[i].tx_bytes));
         }
         for (i = 0; i < num_threads; i++) {
-            for (j = 0; j < num_conns; j++) {
+            for (j = 0; j < cs[i].num_conns; j++) {
                 printf("      t[%d].conns[%d]:  pend=%u  rx_r=%u  tx_r=%u  cnt=%"
                         PRIu64" fd=%d\n",
                         i, j, cs[i].conns[j].pending, cs[i].conns[j].rx_remain,
