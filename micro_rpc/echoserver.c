@@ -62,8 +62,8 @@ extern uint64_t icache_fill64(uint64_t x);
 extern uint64_t icache_fill256(uint64_t x);
 extern uint64_t icache_fill512(uint64_t x);
 
-static uint32_t listen_backlog = 512;
-static uint32_t max_events = 128;
+static uint32_t listen_backlog = 1000;
+static uint32_t max_events = 256;
 static uint32_t max_flows = 4096;
 static uint32_t max_bytes = 1024;
 static uint32_t op_delay = 0;
